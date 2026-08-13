@@ -1,4 +1,5 @@
 import { AggregatedFeedbackScore } from "@/types/shared";
+import { BaseTraceDataErrorInfo } from "@/types/traces";
 
 export enum OPTIMIZATION_STATUS {
   RUNNING = "running",
@@ -58,6 +59,12 @@ export interface NumericalSimilarityMetricParameters {
 
 export interface CodeMetricParameters {
   code: string;
+  // Rename-capable map from a `score()` parameter name to a dataset column
+  // name. Consumed by the backend `_build_code_metric` arguments contract:
+  // each entry exposes `dataset_item[column]` under `param` in the score()
+  // kwargs. `output` is always injected by the backend and never mapped here.
+  // Empty/absent → the backend splats the whole dataset item (back-compat).
+  arguments?: Record<string, string>;
 }
 
 export type MetricParameters =
@@ -176,6 +183,7 @@ export interface Optimization {
   dataset_name: string;
   metadata?: OptimizationMetadata;
   studio_config?: OptimizationStudioConfig;
+  error_info?: BaseTraceDataErrorInfo;
   feedback_scores?: AggregatedFeedbackScore[];
   experiment_scores?: AggregatedFeedbackScore[];
   num_trials: number;
@@ -210,7 +218,14 @@ export type AggregatedCandidate = {
   candidateId: string;
   stepIndex: number;
   parentCandidateIds: string[];
-  trialNumber: number;
+  /**
+   * 1-based "Trial #N" identity, assigned in creation order. `null` marks the
+   * baseline in v2 numbering — the baseline is not a trial, so numbering it
+   * shifted every candidate by one and made the last trial exceed the
+   * configured max_trials (OPIK-7589). v1 is frozen on the old numbering
+   * (baseline = #1), so there the field is always a number.
+   */
+  trialNumber: number | null;
   score: number | undefined;
   runtimeCost: number | undefined;
   latencyP50: number | undefined;

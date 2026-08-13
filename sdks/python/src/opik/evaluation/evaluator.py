@@ -42,7 +42,12 @@ from .suite_evaluators.llm_judge import (
 )
 from .models import ModelCapabilities, base_model, models_factory
 from .scorers import scorer_function, scorer_wrapper_metric
-from .types import ExperimentScoreFunction, LLMTask, ScoringKeyMappingType
+from .types import (
+    ErrorTolerance,
+    ExperimentScoreFunction,
+    LLMTask,
+    ScoringKeyMappingType,
+)
 from .. import url_helpers, exceptions
 from ..api_objects.dataset.test_suite import suite_result_constructor
 
@@ -66,6 +71,29 @@ def _try_notifying_about_experiment_completion(
             experiment.id,
             exc_info=True,
         )
+
+
+def _get_experiment_url(
+    client: opik_client.Opik, experiment_id: str, dataset_id: str
+) -> Optional[str]:
+    """Best-effort direct experiment URL; the experiment is already created by
+    the time this runs, so a failure to resolve the workspace or build the URL
+    must not turn a successful evaluation into an error.
+    """
+    try:
+        return url_helpers.get_experiment_url_by_id(
+            experiment_id=experiment_id,
+            dataset_id=dataset_id,
+            base_url=client.config.url_override,
+            workspace=client._dereferenced_workspace(),
+        )
+    except Exception:
+        LOGGER.debug(
+            "Could not resolve the experiment URL. Experiment ID: %s",
+            experiment_id,
+            exc_info=True,
+        )
+        return None
 
 
 def _materialize_for_checkpoint(
@@ -128,6 +156,7 @@ def evaluate(
     experiment_tags: Optional[List[str]] = None,
     dataset_filter_string: Optional[str] = None,
     blueprint_id: Optional[str] = None,
+    error_tolerance: Union[ErrorTolerance, int] = ErrorTolerance.METRIC_ERRORS,
 ) -> evaluation_result.EvaluationResult:
     """
     Performs task evaluation on a given dataset. You can use either `scoring_metrics` or `scorer_functions` to calculate
@@ -164,9 +193,10 @@ def evaluate(
         scoring_functions: List of scorer functions to be executed during evaluation.
             Each scorer function includes a scoring method that accepts predefined
             arguments supplied by the evaluation engine:
-                • dataset_item — a dictionary containing the dataset item content,
-                • task_outputs — a dictionary containing the LLM task output.
-                • task_span - the data collected during the LLM task execution [optional].
+
+            - dataset_item — a dictionary containing the dataset item content,
+            - task_outputs — a dictionary containing the LLM task output.
+            - task_span - the data collected during the LLM task execution [optional].
 
         verbose: an integer value that controls evaluation output logs such as summary and tqdm progress bar.
             0 - no outputs, 1 - outputs are enabled (default), 2 - outputs are enabled and detailed statistics
@@ -216,7 +246,42 @@ def evaluate(
             - `tags contains "failed"` - Items with 'failed' tag
             - `data.category = "test"` - Items with specific data field value
             - `created_at >= "2024-01-01T00:00:00Z"` - Items created after date
+
+        error_tolerance: How much failure the run absorbs before it gives up.
+            Accepts an ``opik.ErrorTolerance`` member or the equivalent int.
+
+            - ``ErrorTolerance.METRIC_ERRORS`` (10, default): errors raised *inside*
+              ``score`` are recorded as failed score results and the run continues.
+              Anything else aborts. This is the long-standing behaviour.
+            - ``ErrorTolerance.ALL_SCORING_ERRORS`` (20): additionally tolerate errors
+              that stop a metric from being scored at all — a required score argument
+              the dataset does not provide, or an item-level evaluator that cannot be
+              built. Note that neither level stops early — the evaluation task runs
+              for every dataset item before the first failure is re-raised, so a
+              misconfiguration affecting every item costs a full pass either way.
+              What the higher level changes is that you get an ``EvaluationResult``
+              back instead of an exception.
+
+            Two failures always abort, at every level: a failure of the evaluation
+            task itself, and a ``scoring_key_mapping`` callable that raises — neither
+            belongs to a single metric, so neither can be reported as one metric's
+            failed score.
+
+            A tolerated failure of a metric is also recorded on a span named after
+            it, carrying the same ``error_info``, so it is visible in the trace even
+            though a failed score is never persisted as a feedback score. Failures
+            building an item-level evaluator happen before any metric span exists,
+            so those carry the payload on the score result only.
+
+            Tolerated failures are accumulated in the returned ``EvaluationResult``:
+            every one is a ``ScoreResult`` with ``scoring_failed=True``, ``reason``
+            set to the error message and ``metadata["error_info"]`` holding the
+            structured payload (``exception_type``, ``message``, ``traceback``).
+            They are excluded from the aggregated statistics and are never sent to
+            the backend, so the score cell stays empty rather than showing a zero.
     """
+    error_tolerance = ErrorTolerance(error_tolerance)
+
     if isinstance(dataset, test_suite_module.TestSuite):
         # backwards compatibility for transition period
         dataset = dataset.__internal_api__dataset__
@@ -258,6 +323,7 @@ def evaluate(
         nb_samples=nb_samples,
         dataset_sampler=dataset_sampler,
         dataset_item_ids=dataset_item_ids,
+        error_tolerance=error_tolerance,
     )
 
     experiment = client.create_experiment(
@@ -310,6 +376,7 @@ def evaluate(
         trial_count=trial_count,
         experiment_scoring_functions=experiment_scoring_functions,
         source="experiment",
+        error_tolerance=error_tolerance,
     )
 
 
@@ -405,12 +472,11 @@ def __internal_api__run_test_suite__(
     )
 
     if verbose >= 1:
-        experiment_url = url_helpers.get_experiment_url_by_id(
-            experiment_id=experiment_.id,
-            dataset_id=suite_dataset.id,
-            url_override=client.config.url_override,
+        experiment_url = _get_experiment_url(
+            client, experiment_id=experiment_.id, dataset_id=suite_dataset.id
         )
-        report.display_evaluation_in_progress(experiment_url)
+        if experiment_url is not None:
+            report.display_evaluation_in_progress(experiment_url)
 
     eval_result, total_time = _evaluate_test_suite_task(
         client=client,
@@ -560,6 +626,7 @@ def _evaluate_task(
     trial_count: int,
     experiment_scoring_functions: List[ExperimentScoreFunction],
     source: TraceSource,
+    error_tolerance: ErrorTolerance,
 ) -> evaluation_result.EvaluationResult:
     start_time = time.time()
 
@@ -575,6 +642,7 @@ def _evaluate_task(
             workers=task_threads,
             verbose=verbose,
             source=source,
+            error_tolerance=error_tolerance,
         )
         test_results = evaluation_engine.run_and_score(
             dataset_items=items_iter,
@@ -600,13 +668,11 @@ def _evaluate_task(
             dataset.name, total_time, test_results, computed_experiment_scores
         )
 
-    experiment_url = url_helpers.get_experiment_url_by_id(
-        experiment_id=experiment.id,
-        dataset_id=dataset.id,
-        url_override=client.config.url_override,
+    experiment_url = _get_experiment_url(
+        client, experiment_id=experiment.id, dataset_id=dataset.id
     )
-
-    report.display_experiment_link(experiment_url=experiment_url)
+    if experiment_url is not None:
+        report.display_experiment_link(experiment_url=experiment_url)
 
     client.flush()
 
@@ -713,6 +779,8 @@ def _evaluate_test_suite_task(
                 workers=task_threads,
                 verbose=verbose,
                 source=source,
+                # This entrypoint does not expose the setting; it runs strict.
+                error_tolerance=ErrorTolerance.METRIC_ERRORS,
             )
             test_results = evaluation_engine.run_and_score(
                 dataset_items=items_iter,
@@ -733,10 +801,8 @@ def _evaluate_test_suite_task(
 
     total_time = time.time() - start_time
 
-    experiment_url = url_helpers.get_experiment_url_by_id(
-        experiment_id=experiment.id,
-        dataset_id=dataset.id,
-        url_override=client.config.url_override,
+    experiment_url = _get_experiment_url(
+        client, experiment_id=experiment.id, dataset_id=dataset.id
     )
 
     evaluation_result_ = evaluation_result.EvaluationResult(
@@ -783,9 +849,10 @@ def evaluate_experiment(
         scoring_functions: List of scorer functions to be executed during evaluation.
             Each scorer function includes a scoring method that accepts predefined
             arguments supplied by the evaluation engine:
-                • dataset_item — a dictionary containing the dataset item content,
-                • task_outputs — a dictionary containing the LLM task output.
-                • task_span - the data collected during the LLM task execution [optional].
+
+            - dataset_item — a dictionary containing the dataset item content,
+            - task_outputs — a dictionary containing the LLM task output.
+            - task_span - the data collected during the LLM task execution [optional].
 
         scoring_threads: amount of thread workers to run scoring metrics.
 
@@ -853,6 +920,8 @@ def evaluate_experiment(
             workers=scoring_threads,
             verbose=verbose,
             source="experiment",
+            # This entrypoint does not expose the setting; it runs strict.
+            error_tolerance=ErrorTolerance.METRIC_ERRORS,
         )
         test_results = evaluation_engine.score_test_cases(
             test_cases=test_cases,
@@ -878,13 +947,11 @@ def evaluate_experiment(
             computed_experiment_scores,
         )
 
-    experiment_url = url_helpers.get_experiment_url_by_id(
-        experiment_id=experiment.id,
-        dataset_id=dataset_.id,
-        url_override=client.config.url_override,
+    experiment_url = _get_experiment_url(
+        client, experiment_id=experiment.id, dataset_id=dataset_.id
     )
-
-    report.display_experiment_link(experiment_url=experiment_url)
+    if experiment_url is not None:
+        report.display_experiment_link(experiment_url=experiment_url)
 
     _try_notifying_about_experiment_completion(experiment)
 
@@ -1003,9 +1070,10 @@ def evaluate_prompt(
         scoring_functions: List of scorer functions to be executed during evaluation.
             Each scorer function includes a scoring method that accepts predefined
             arguments supplied by the evaluation engine:
-                • dataset_item — a dictionary containing the dataset item content,
-                • task_outputs — a dictionary containing the LLM task output.
-                • task_span - the data collected during the LLM task execution [optional].
+
+            - dataset_item — a dictionary containing the dataset item content,
+            - task_outputs — a dictionary containing the LLM task output.
+            - task_span - the data collected during the LLM task execution [optional].
 
         experiment_name_prefix: The prefix to be added to automatically generated experiment names to make them unique
             but grouped under the same prefix. For example, if you set `experiment_name_prefix="my-experiment"`,
@@ -1106,6 +1174,7 @@ def evaluate_prompt(
         nb_samples=nb_samples,
         dataset_sampler=dataset_sampler,
         dataset_item_ids=dataset_item_ids,
+        error_tolerance=ErrorTolerance.METRIC_ERRORS,
     )
 
     experiment = client.create_experiment(
@@ -1157,6 +1226,8 @@ def evaluate_prompt(
             workers=task_threads,
             verbose=verbose,
             source="experiment",
+            # This entrypoint does not expose the setting; it runs strict.
+            error_tolerance=ErrorTolerance.METRIC_ERRORS,
         )
         test_results = evaluation_engine.run_and_score(
             dataset_items=items_iter,
@@ -1182,13 +1253,11 @@ def evaluate_prompt(
             dataset.name, total_time, test_results, computed_experiment_scores
         )
 
-    experiment_url = url_helpers.get_experiment_url_by_id(
-        experiment_id=experiment.id,
-        dataset_id=dataset.id,
-        url_override=client.config.url_override,
+    experiment_url = _get_experiment_url(
+        client, experiment_id=experiment.id, dataset_id=dataset.id
     )
-
-    report.display_experiment_link(experiment_url=experiment_url)
+    if experiment_url is not None:
+        report.display_experiment_link(experiment_url=experiment_url)
 
     client.flush()
 
@@ -1239,12 +1308,18 @@ def evaluate_optimization_trial(
     experiment_scoring_functions: Optional[List[ExperimentScoreFunction]] = None,
     experiment_tags: Optional[List[str]] = None,
     dataset_filter_string: Optional[str] = None,
+    experiment_type: Optional[str] = None,
 ) -> evaluation_result.EvaluationResult:
     """
     Performs task evaluation on a given dataset.
 
     Args:
         optimization_id: The ID of the optimization associated with the experiment.
+
+        experiment_type: The experiment type recorded for this trial. Optimizers use
+            "mini-batch" for small-sample candidate screening evaluations and "trial"
+            (default) for full evaluations, so that mini-batch scores are excluded
+            from best-score aggregations.
 
         dataset: An Opik Dataset or DatasetVersion instance
 
@@ -1254,9 +1329,10 @@ def evaluate_optimization_trial(
         scoring_functions: List of scorer functions to be executed during evaluation.
             Each scorer function includes a scoring method that accepts predefined
             arguments supplied by the evaluation engine:
-                • dataset_item — a dictionary containing the dataset item content,
-                • task_outputs — a dictionary containing the LLM task output.
-                • task_span - the data collected during the LLM task execution [optional].
+
+            - dataset_item — a dictionary containing the dataset item content,
+            - task_outputs — a dictionary containing the LLM task output.
+            - task_span - the data collected during the LLM task execution [optional].
 
         experiment_name_prefix: The prefix to be added to automatically generated experiment names to make them unique
                     but grouped under the same prefix. For example, if you set `experiment_name_prefix="my-experiment"`,
@@ -1371,6 +1447,7 @@ def evaluate_optimization_trial(
         nb_samples=nb_samples,
         dataset_sampler=dataset_sampler,
         dataset_item_ids=dataset_item_ids,
+        error_tolerance=ErrorTolerance.METRIC_ERRORS,
     )
 
     experiment = client.create_experiment(
@@ -1378,7 +1455,7 @@ def evaluate_optimization_trial(
         dataset_name=dataset.name,
         experiment_config=experiment_config,
         prompts=checked_prompts,
-        type="trial",
+        type=experiment_type or "trial",
         optimization_id=optimization_id,
         tags=experiment_tags,
         dataset_version_id=getattr(dataset.get_version_info(), "id", None),
@@ -1418,6 +1495,9 @@ def evaluate_optimization_trial(
         trial_count=trial_count,
         experiment_scoring_functions=experiment_scoring_functions,
         source="optimization",
+        # Resuming or replaying a trial does not carry the original
+        # caller's tolerance, so it runs at the default.
+        error_tolerance=ErrorTolerance.METRIC_ERRORS,
     )
 
 
@@ -1535,6 +1615,10 @@ def evaluate_resume(
         trial_count=context.default_runs_per_item,
         experiment_scoring_functions=experiment_scoring_functions,
         source="experiment",
+        # The tolerance the original evaluation call ran with, read back from the
+        # resume state, so a resumed run does not silently become stricter than
+        # the run it continues.
+        error_tolerance=context.error_tolerance,
     )
 
     merged = evaluation_result.merge_resume_results(
@@ -1619,8 +1703,9 @@ def evaluate_on_dict_items(
 
         scoring_functions: List of scorer functions to be executed during evaluation.
             Each scorer function accepts predefined arguments:
-                • dataset_item — a dictionary containing the dataset item content,
-                • task_outputs — a dictionary containing the LLM task output.
+
+            - dataset_item — a dictionary containing the dataset item content,
+            - task_outputs — a dictionary containing the LLM task output.
 
         project_name: The name of the project for logging traces.
 
@@ -1696,6 +1781,8 @@ def evaluate_on_dict_items(
             workers=scoring_threads,
             verbose=verbose,
             source="experiment",
+            # This entrypoint does not expose the setting; it runs strict.
+            error_tolerance=ErrorTolerance.METRIC_ERRORS,
         )
         test_results = evaluation_engine.run_and_score(
             dataset_items=iter(dataset_items),
@@ -1723,7 +1810,7 @@ def _wrap_scoring_functions(
             scoring_functions, project_name=project_name
         )
         if scoring_metrics:
-            scoring_metrics.extend(function_metrics)
+            scoring_metrics = [*scoring_metrics, *function_metrics]
         else:
             scoring_metrics = function_metrics
 
